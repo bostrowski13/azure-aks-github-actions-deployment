@@ -1,2 +1,14 @@
 ---
 # Top level config
+myApp:
+  service_name:  myApp
+  label_selector: app.kubernetes.io/name=myApp
+  chart_name: myApp
+  chart_version: 1.0.0
+  values_file: myApp/values.yaml
+  helm_version: v4
+  chart_values:
+    replicaCount: 1
+    #moreProperties: etc
+
+# Repeats above for each app
