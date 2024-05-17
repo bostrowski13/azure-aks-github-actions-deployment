@@ -1,0 +1,192 @@
+---
+
+# References:
+# https://docs.github.com/en/actions/deployment/deploying-to-your-cloud-provider/deploying-to-azure/deploying-to-azure-kubernetes-service
+# https://github.com/Azure/setup-helm
+# https://github.com/actions/starter-workflows/blob/main/deployments/azure-kubernetes-service-helm.yml
+# https://github.com/Azure/k8s-bake
+# https://github.com/Azure/k8s-deploy
+# https://github.com/marketplace/actions/yaml-read
+
+# This pipeline uses the ".github/actions/helm-deploy/action.yml" step as a t
+# emplate to be able to define and deploy multiple appliations via this pipeline.
+
+name: AKS Application Application Deploy
+run-name: ${{ inputs.stamp }} - ${{ inputs.environment }} Application Deployment
+
+env:
+  HELM_REGISTRY: "mibuild.azurecr.io"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        required: true
+        description: "Environment used for deployment"
+        options:
+          - "sd1-eus2"
+          - "sd1-cus"
+          - "bug-test"
+          - "bug-test-dr"
+        default: sd1-eus2
+
+      stamp:
+        type: choice
+        required: true
+        description: "Environment profile used for deployment"
+        options:
+          - "dev"
+          - "qe"
+          - "stg"
+          - "perf"
+        default: dev
+
+      runs-on:
+        type: string
+        required: false
+        description: "Agent to run the job on"
+        default: ubuntu-latest
+
+      helm-namespace:
+        type: string
+        required: true
+        description: "Helm Chart Namespace"
+        default: test
+
+      cert-file-path:
+        type: string
+        required: true
+        description: Relative path to cert file
+        default: "../../cert.pem"
+
+      ca-cert-file-path:
+        type: string
+        required: true
+        description: Relative path to CA cert file
+        default: "../../ca-cert.pem"
+
+# ensure oidc has permissions to login to azure
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Diagnostic info
+        run: |
+          echo "Deploying Applications to ${{ inputs.environment }} in Azure subscription ${{ secrets.ARM_SUBSCRIPTION_ID }}"
+        shell: bash
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Registry Login
+        uses: Azure/docker-login@v1
+        with:
+          login-server: ${{ env.HELM_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS Information for Deploy and Set Environment Vars
+        shell: bash
+        run: |
+          #!/bin/sh
+          # shellcheck disable=SC2086
+          # shellcheck disable=SC2145
+
+          echo "AZ_RESOURCE_GROUP=$(az group list --query "[?ends_with(name, '${{ inputs.environment }}-rg-aks')].name" -o tsv)" >> $GITHUB_ENV
+          if [ -z "${AZ_RESOURCE_GROUP}" ]; then
+            echo -e "Unable to determine Resource Group.  Exiting."
+            exit 1
+          else
+            echo -e "Resource Group set to: $AZ_RESOURCE_GROUP"
+          fi
+
+          # Fetch the AKS Cluster Name for the target environment and region
+          echo "AZ_AKS_CLUSTER_NAME=$(az aks list --resource-group $AZ_RESOURCE_GROUP --query "[].name" -o tsv)" >> $GITHUB_ENV
+          if [ -z "${AZ_AKS_CLUSTER_NAME}" ]; then
+            echo -e "Unable to determine AKS Cluster.  Exiting."
+            exit 1
+          else
+            echo -e "AKS Cluster Name set to: $AZ_AKS_CLUSTER_NAME"
+          fi
+
+          # Fetch Keyvault Name
+          ################################################################################################
+          # NOTE: Keyvault is only deployed to EUS2, so we need to split the environment to get the first
+          # part of the array to substitute it in to the resource group name to look it up correctly,
+          # regardless of the region in the environment name
+          ################################################################################################
+          IFS='-' read -ra env_array <<< "${{ inputs.environment }}"
+
+          echo "AZ_KEYVAULT_NAME=$(az keyvault list --resource-group RE_NAME --query "[].name" -o tsv)" >> $GITHUB_ENV
+          if [ -z "${AZ_KEYVAULT_NAME}" ]; then
+            echo -e "Unable to determine Key Vault.  Exiting."
+            exit 1
+          else
+            echo -e "Key Vault set to: $AZ_KEYVAULT_NAME"
+          fi
+
+      - name: Set AKS Context
+        uses: Azure/aks-set-context@v4
+        with:
+          cluster-name: ${{ env.AZ_AKS_CLUSTER_NAME }}
+          resource-group: ${{ env.AZ_RESOURCE_GROUP }}
+
+      - name: Pull Certificate from Key Vault
+        uses: azure/CLI@2
+        with:
+          inlineScript: |
+            value=$(az keyvault secret show --vault-name ${{ env.AZ_KEYVAULT_NAME }} --name cert --query value -o tsv)
+            echo "$value" | base64 --decode > ${{ inputs.cert-file-path }}
+
+      - name: Pull CA Certificate from Key Vault
+        uses: azure/CLI@2
+        with:
+          inlineScript: |
+            value=$(az keyvault secret show --vault-name ${{ env.AZ_KEYVAULT_NAME }} --name cert-ca --query value -o tsv)
+            echo "$value" | base64 --decode > ${{ inputs.ca-cert-file-path }}
+
+      ############################################################
+      # This will be the repeatable part, per service
+      ############################################################
+      - name: Deploying My Application via Helm
+        uses: ./.github/actions/helm-deploy
+        with:
+          helm-namespace: ${{ inputs.helm-namespace }}
+          application-key: "MyApp"
+          stamp: ${{ inputs.stamp }}
+          environment: ${{ inputs.environment }}
+          cert-file-path: ${{ inputs.cert-file-path }}
+          ca-cert-file-path: ${{ inputs.ca-cert-file-path }}
+      ############################################################
+      # This will be the repeatable part, per service
+      ############################################################
+
+      - name: Clear Azure CLI Credentials
+        uses: azure/CLI@2
+        if: ${{ always() }}
+        with:
+          inlineScript: |
+            az logout
+            az cache purge
+            az account clear
