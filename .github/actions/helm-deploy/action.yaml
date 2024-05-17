@@ -1,0 +1,108 @@
+---
+
+name: Deploy helm chart
+description: Deploy a helm chart to the AKS cluster
+inputs:
+  helm-namespace:
+    description: Helm namespace
+    required: false
+    default: ""
+
+  application-key:
+    description: Application name (used to lookup values form config files)
+    required: true
+
+  stamp:
+    description: Environment profile used for deployment
+    required: true
+
+  environment:
+    description: "Environment used for deployment"
+    required: true
+
+  cert-file-path:
+    description: Relative path to cert file
+    required: true
+
+  ca-cert-file-path:
+    description: Relative path to CA cert file
+    required: true
+
+  force_deploy:
+    description: Force deployment of application
+    required: true
+    default: false
+
+  annotate-namespace:
+    description: The namespace will be manually created and annotated with this annotation
+    required: false
+    default: ""
+
+  annotate-namespace-extra:
+    description: Extra annotation if needed
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Read Base Config File
+      uses: pietrobolcato/action-read-yaml@1.1.0
+      id: read_base_config_file
+      with:
+        config: ${{ github.workspace }}/env/base-access-config.yaml
+
+    - name: Read Profile Config File
+      uses: pietrobolcato/action-read-yaml@1.1.0
+      id: read_profile_config_file
+      with:
+        config: ${{ github.workspace }}/env/${{ inputs.stamp }}/profile-access-config.yaml
+
+    - name: Read Overrides Config File
+      uses: pietrobolcato/action-read-yaml@1.1.0
+      id: read_overrides_config_file
+      with:
+        config: ${{ github.workspace }}/env/${{ inputs.stamp }}/${{ inputs.environment }}/overrides-access-config.yaml
+
+    - name: Fetch Secrets from Key Vault and Assign to TPL file
+      uses: azure/CLI@2
+      with:
+        inlineScript: |
+          value=$(az keyvault secret show --vault-name ${{ env.AZ_KEYVAULT_NAME }} --name access-secrets --query value -o tsv)
+          echo "$value" > "../../helm/${{ inputs.application-key }}.secrets.tpl"
+
+    - name: Lint manifest files
+      uses: azure/k8s-lint@v1
+      with:
+        lintType: dryrun
+        manifests: |
+          "../../helm/${{ inputs.application-key }}"
+
+    - name: Bake manifest files to be used for deployments
+      uses: azure/k8s-bake@v3
+      with:
+        renderEngine: 'helm'
+        helmChart: "../../helm/${{ inputs.application-key }}"
+        arguments: |
+          --cert-file
+          ${{ inputs.cert-file-path }}
+          --ca-file
+          ${{ inputs.ca-cert-file-path }}
+        overrides: |
+          ${{ steps.read_base_config_file.outputs['${{ inputs.application-key }}.chart_values'] }}
+          ${{ steps.read_profile_config_file.outputs['${{ inputs.application-key }}.chart_values'] }}
+          ${{ steps.read_overrides_config_file.outputs['${{ inputs.application-key }}.chart_values'] }}
+        releaseName: ${{ steps.read_base_config_file.outputs['${{ inputs.application-key }}.chart_version'] }}
+        silent: 'false'
+      id: bake
+
+    - name: Deploy Helm Chart for the Application
+      uses: Azure/k8s-deploy@v5
+      with:
+        namespace: ${{ inputs.helm-namespace }}
+        manifests: ${{ steps.bake.outputs.manifestsBundle }}
+        action: deploy
+        force: ${{ inputs.force_deploy }}
+        strategy: basic
+        annotate-resources: ${{ inputs.annotate-namespace }}
+        annotate-namespace: ${{ inputs.annotate-namespace-extra }}
